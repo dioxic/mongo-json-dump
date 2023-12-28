@@ -5,6 +5,7 @@ import com.mongodb.reactivestreams.client.FindPublisher;
 import com.mongodb.reactivestreams.client.MongoClient;
 import com.mongodb.reactivestreams.client.MongoClients;
 import org.bson.Document;
+import org.bson.RawBsonDocument;
 import org.bson.UuidRepresentation;
 import org.bson.codecs.*;
 import org.bson.json.JsonMode;
@@ -14,10 +15,11 @@ import picocli.CommandLine;
 import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
 import reactor.core.publisher.Flux;
-import reactor.core.publisher.Mono;
+import reactor.core.scheduler.Schedulers;
 
 import java.io.BufferedWriter;
 import java.io.IOException;
+import java.io.StringWriter;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -35,8 +37,8 @@ public class Application implements Callable<Integer> {
     @Option(names = {"--uri"}, description = "mongodb uri", defaultValue = "mongodb://localhost:27017")
     private String uri;
 
-    @Option(names = {"--concurrency"}, description = "concurrency factor", defaultValue = "4")
-    private Integer concurrency;
+//    @Option(names = {"--concurrency"}, description = "concurrency factor", defaultValue = "4")
+//    private Integer concurrency;
 
     @Option(names = {"-o", "--output"}, description = "output directory", defaultValue = "dump")
     private Path outputDir;
@@ -47,8 +49,14 @@ public class Application implements Callable<Integer> {
     @Option(names = {"--limit"}, description = "limit the document per collection")
     private Integer limit;
 
-    @Option(names = { "--skipOutput"}, description = "skip writing out to the disk")
+    @Option(names = {"--skipOutput"}, description = "skip writing out to the disk", defaultValue = "false")
     private Boolean skipOutput;
+
+    @Option(names = {"--skipJson"}, description = "skip json conversion", defaultValue = "false")
+    private Boolean skipJsonConvert;
+
+    @Option(names = {"--batchSize"}, description = "cursor batch size")
+    private Integer batchSize = 10000;
 
     @Option(
             names = {"--nsExclude"},
@@ -69,6 +77,10 @@ public class Application implements Callable<Integer> {
             nsExclude.add(new MongoNamespace("config.*"));
         }
 
+        if (skipJsonConvert) {
+            skipOutput = true;
+        }
+
         Files.createDirectories(outputDir);
         JsonWriterSettings jws = JsonWriterSettings.builder().outputMode(JsonMode.RELAXED).build();
         Codec<Document> DEFAULT_CODEC =
@@ -76,35 +88,41 @@ public class Application implements Callable<Integer> {
                         new CollectionCodecProvider(), new IterableCodecProvider(),
                         new BsonValueCodecProvider(), new DocumentCodecProvider(), new MapCodecProvider())), UuidRepresentation.STANDARD)
                         .get(Document.class);
+        RawBsonDocumentCodec rawCodec = new RawBsonDocumentCodec();
 
         try (MongoClient client = MongoClients.create(uri)) {
             MongoUtil.getNamespaces(client)
                     .filter(ns -> nsExclude == null || !nsContains(ns, nsExclude))
-                    .map(ns -> client.getDatabase(ns.getDatabaseName()).getCollection(ns.getCollectionName()))
+                    .map(ns -> client.getDatabase(ns.getDatabaseName()).getCollection(ns.getCollectionName(), RawBsonDocument.class))
                     .map(coll -> {
                         String collectionName = coll.getNamespace().getCollectionName();
                         Path path = outputDir.resolve(collectionName + ".json");
 
-                        try (BufferedWriter writer = Files.newBufferedWriter(path)) {
-                            FindPublisher<Document> cursor = coll.find();
+                        System.out.println("Processing " + collectionName + "...");
+
+                        try (BufferedWriter fileWriter = Files.newBufferedWriter(path)) {
+                            FindPublisher<RawBsonDocument> cursor = coll.find().batchSize(batchSize);
                             if (limit != null) {
                                 cursor = cursor.limit(limit);
                             }
 
-                            return Flux.from(cursor)
-                                    .flatMap(doc -> {
-                                        JsonWriter jsonWriter = new JsonWriter(writer, jws);
-                                        DEFAULT_CODEC.encode(jsonWriter, doc, EncoderContext.builder().build());
-                                        return Mono.empty();
-                                    }, concurrency)
-//                                    .doOnNext(json -> {
-//                                        try {
-//                                            writer.write(json);
-//                                            writer.newLine();
-//                                        } catch (IOException e) {
-//                                            throw new RuntimeException(e);
-//                                        }
-//                                    })
+                            return Flux.from(cursor).parallel()
+                                    .runOn(Schedulers.parallel())
+                                    .doOnNext(doc -> {
+                                        if (!skipJsonConvert) {
+                                            StringWriter stringWriter = new StringWriter();
+                                            JsonWriter jsonWriter = new JsonWriter(stringWriter, jws);
+                                            rawCodec.encode(jsonWriter, doc, EncoderContext.builder().build());
+                                            if (!skipOutput) {
+                                                try {
+                                                    fileWriter.write(stringWriter.append("\n").toString());
+                                                } catch (IOException e) {
+                                                    throw new RuntimeException(e);
+                                                }
+                                            }
+                                        }
+                                    })
+                                    .sequential()
                                     .count()
                                     .map(count -> count + " docs written for " + coll.getNamespace() + " collection")
                                     .block();
