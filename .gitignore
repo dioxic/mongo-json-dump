@@ -6,3 +6,4 @@ build/
 
 ### IntelliJ IDEA ###
 .idea
+/mongo-json-dump.iml
