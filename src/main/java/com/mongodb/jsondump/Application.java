@@ -1,24 +1,35 @@
 package com.mongodb.jsondump;
 
 import com.mongodb.MongoNamespace;
+import com.mongodb.reactivestreams.client.FindPublisher;
 import com.mongodb.reactivestreams.client.MongoClient;
 import com.mongodb.reactivestreams.client.MongoClients;
+import org.bson.Document;
+import org.bson.UuidRepresentation;
+import org.bson.codecs.*;
+import org.bson.json.JsonMode;
+import org.bson.json.JsonWriter;
+import org.bson.json.JsonWriterSettings;
 import picocli.CommandLine;
+import picocli.CommandLine.Command;
 import picocli.CommandLine.Option;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
-import reactor.core.publisher.SynchronousSink;
 
 import java.io.BufferedWriter;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.Callable;
-import java.util.function.BiConsumer;
 
 import static com.mongodb.jsondump.MongoUtil.nsContains;
+import static java.util.Arrays.asList;
+import static org.bson.codecs.configuration.CodecRegistries.fromProviders;
+import static org.bson.codecs.configuration.CodecRegistries.withUuidRepresentation;
 
+@Command(name = "mongojsondump")
 public class Application implements Callable<Integer> {
 
     @Option(names = {"--uri"}, description = "mongodb uri", defaultValue = "mongodb://localhost:27017")
@@ -30,6 +41,15 @@ public class Application implements Callable<Integer> {
     @Option(names = {"-o", "--output"}, description = "output directory", defaultValue = "dump")
     private Path outputDir;
 
+    @Option(names = {"--includeSystem"}, description = "include system databases (config, admin, local)", defaultValue = "false")
+    private Boolean includeSystemCollections;
+
+    @Option(names = {"--limit"}, description = "limit the document per collection")
+    private Integer limit;
+
+    @Option(names = { "--skipOutput"}, description = "skip writing out to the disk")
+    private Boolean skipOutput;
+
     @Option(
             names = {"--nsExclude"},
             description = "exclude matching namespaces",
@@ -40,6 +60,23 @@ public class Application implements Callable<Integer> {
     @Override
     public Integer call() throws Exception {
 
+        if (!includeSystemCollections) {
+            if (nsExclude == null) {
+                nsExclude = new ArrayList<>();
+            }
+            nsExclude.add(new MongoNamespace("admin.*"));
+            nsExclude.add(new MongoNamespace("local.*"));
+            nsExclude.add(new MongoNamespace("config.*"));
+        }
+
+        Files.createDirectories(outputDir);
+        JsonWriterSettings jws = JsonWriterSettings.builder().outputMode(JsonMode.RELAXED).build();
+        Codec<Document> DEFAULT_CODEC =
+                withUuidRepresentation(fromProviders(asList(new ValueCodecProvider(),
+                        new CollectionCodecProvider(), new IterableCodecProvider(),
+                        new BsonValueCodecProvider(), new DocumentCodecProvider(), new MapCodecProvider())), UuidRepresentation.STANDARD)
+                        .get(Document.class);
+
         try (MongoClient client = MongoClients.create(uri)) {
             MongoUtil.getNamespaces(client)
                     .filter(ns -> nsExclude == null || !nsContains(ns, nsExclude))
@@ -47,19 +84,29 @@ public class Application implements Callable<Integer> {
                     .map(coll -> {
                         String collectionName = coll.getNamespace().getCollectionName();
                         Path path = outputDir.resolve(collectionName + ".json");
+
                         try (BufferedWriter writer = Files.newBufferedWriter(path)) {
-                            return Flux.from(coll.find())
-                                    .flatMap(doc -> Mono.just(doc.toJson()), concurrency)
-                                    .doOnNext(json -> {
-                                        try {
-                                            writer.write(json);
-                                            writer.newLine();
-                                        } catch (IOException e) {
-                                            throw new RuntimeException(e);
-                                        }
-                                    })
+                            FindPublisher<Document> cursor = coll.find();
+                            if (limit != null) {
+                                cursor = cursor.limit(limit);
+                            }
+
+                            return Flux.from(cursor)
+                                    .flatMap(doc -> {
+                                        JsonWriter jsonWriter = new JsonWriter(writer, jws);
+                                        DEFAULT_CODEC.encode(jsonWriter, doc, EncoderContext.builder().build());
+                                        return Mono.empty();
+                                    }, concurrency)
+//                                    .doOnNext(json -> {
+//                                        try {
+//                                            writer.write(json);
+//                                            writer.newLine();
+//                                        } catch (IOException e) {
+//                                            throw new RuntimeException(e);
+//                                        }
+//                                    })
                                     .count()
-                                    .map(count -> count + " docs written for " + collectionName + " collection")
+                                    .map(count -> count + " docs written for " + coll.getNamespace() + " collection")
                                     .block();
                         } catch (IOException e) {
                             throw new RuntimeException(e);
@@ -71,14 +118,6 @@ public class Application implements Callable<Integer> {
 
         return 0;
     }
-
-    BiConsumer<String, SynchronousSink<Integer>> handler = (input, sink) -> {
-        if (input.matches("\\D")) {
-            sink.error(new NumberFormatException());
-        } else {
-            sink.next(Integer.parseInt(input));
-        }
-    };
 
     public static void main(String... args) {
         int exitCode = new CommandLine(new Application()).execute(args);
