@@ -37,9 +37,6 @@ public class Application implements Callable<Integer> {
     @Option(names = {"--uri"}, description = "mongodb uri", defaultValue = "mongodb://localhost:27017")
     private String uri;
 
-//    @Option(names = {"--concurrency"}, description = "concurrency factor", defaultValue = "4")
-//    private Integer concurrency;
-
     @Option(names = {"-o", "--output"}, description = "output directory", defaultValue = "dump")
     private Path outputDir;
 
@@ -48,12 +45,6 @@ public class Application implements Callable<Integer> {
 
     @Option(names = {"--limit"}, description = "limit the document per collection")
     private Integer limit;
-
-    @Option(names = {"--skipOutput"}, description = "skip writing out to the disk", defaultValue = "false")
-    private Boolean skipOutput;
-
-    @Option(names = {"--skipJson"}, description = "skip json conversion", defaultValue = "false")
-    private Boolean skipJsonConvert;
 
     @Option(names = {"--batchSize"}, description = "cursor batch size")
     private Integer batchSize = 10000;
@@ -75,10 +66,6 @@ public class Application implements Callable<Integer> {
             nsExclude.add(new MongoNamespace("admin.*"));
             nsExclude.add(new MongoNamespace("local.*"));
             nsExclude.add(new MongoNamespace("config.*"));
-        }
-
-        if (skipJsonConvert) {
-            skipOutput = true;
         }
 
         Files.createDirectories(outputDir);
@@ -109,17 +96,13 @@ public class Application implements Callable<Integer> {
                             return Flux.from(cursor).parallel()
                                     .runOn(Schedulers.parallel())
                                     .doOnNext(doc -> {
-                                        if (!skipJsonConvert) {
-                                            StringWriter stringWriter = new StringWriter();
-                                            JsonWriter jsonWriter = new JsonWriter(stringWriter, jws);
-                                            rawCodec.encode(jsonWriter, doc, EncoderContext.builder().build());
-                                            if (!skipOutput) {
-                                                try {
-                                                    fileWriter.write(stringWriter.append("\n").toString());
-                                                } catch (IOException e) {
-                                                    throw new RuntimeException(e);
-                                                }
-                                            }
+                                        StringWriter stringWriter = new StringWriter();
+                                        JsonWriter jsonWriter = new JsonWriter(stringWriter, jws);
+                                        rawCodec.encode(jsonWriter, doc, EncoderContext.builder().build());
+                                        try {
+                                            fileWriter.write(stringWriter.append("\n").toString());
+                                        } catch (IOException e) {
+                                            throw new RuntimeException(e);
                                         }
                                     })
                                     .sequential()
